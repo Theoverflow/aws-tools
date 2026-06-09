@@ -7,7 +7,7 @@ Two deployment options:
 | Option | Path | Best for |
 |--------|------|----------|
 | **Rust CLI** | this directory | Laptop, CI, no AWS CLI dependency |
-| **Step Functions** | [stepfunctions/](./stepfunctions/) | Scheduled/automated runs in AWS |
+| **Step Functions** | [stepfunctions/](./stepfunctions/) | Scheduled/automated runs in AWS (idempotent + rollback) |
 
 ## Rust CLI
 

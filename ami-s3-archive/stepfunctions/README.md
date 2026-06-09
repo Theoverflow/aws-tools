@@ -9,7 +9,7 @@ This is the **orchestrated** deployment option for [ami-s3-archive](../README.md
 | Resource | Purpose |
 |----------|---------|
 | **Step Functions state machine** | Orchestrates EC2 `CreateStoreImageTask`, polling, S3 conversion, optional cleanup |
-| **Helper Lambda** (`helper.py`) | Bucket prep, and S3 copy/multipart copy for objects ≥ 5 GiB |
+| **Helper Lambda** (`helper.py`) | Bucket prep, S3 copy/multipart copy, rollback |
 | **IAM roles** | Least-privilege permissions for EC2 AMI Store, EBS Direct API, S3, and Lambda invoke |
 
 ## Architecture
@@ -23,7 +23,38 @@ Input (amiId, bucket, options)
   -> ConvertObjectToStorageClass (Lambda: CopyObject or multipart copy)
   -> [Optional DeregisterImage]
   -> Success
+
+On failure after partial progress, the state machine invokes `RollbackResources` (same policy as the Rust CLI).
 ```
+
+## Idempotency
+
+Re-running an execution with the same input is safe:
+
+| Existing state | Behavior |
+|----------------|----------|
+| Object already in target storage class | Skip store + conversion → optional cleanup |
+| Object exists but wrong storage class | Skip store → convert only |
+| EC2 store task `Completed` | Skip store → convert |
+| EC2 store task `InProgress` | Resume polling (no new store task) |
+| Nothing started yet | Create store task |
+
+The `convert` helper is also idempotent: it no-ops when the object is already in the requested storage class.
+
+## Rollback on failure
+
+If the workflow fails after mutating resources, the `RollbackResources` state invokes the helper with `op=rollback`:
+
+| Condition | Rollback action |
+|-----------|-----------------|
+| Storage-class conversion failed mid-way | Abort in-progress multipart uploads |
+| Store task started this run, archive never verified | Delete incomplete S3 object |
+| Bucket created this run | Delete bucket (only if empty) |
+| Archive completed | **Preserve** object — re-run execution to resume |
+
+Rollback actions are recorded in `$.rollback.result.actions` in the execution history.
+
+Cleanup failures (`CleanupFailed`) do **not** roll back a successful archive.
 
 ## Prerequisites
 
@@ -184,7 +215,8 @@ Use EC2 `CreateRestoreImageTask` against the S3 object (e.g. `s3://bucket/ami-01
 | `StoreImageTaskFailed` | `aws ec2 describe-store-image-tasks --image-ids ami-…` and CloudTrail |
 | Lambda timeout on convert | Increase `HelperTimeoutSeconds` (max 900) in `template.yaml` / deploy params |
 | Access denied on bucket | Bucket policy must allow the state machine role and EC2 store task principal |
-| Execution stuck in poll loop | Store task still `InProgress`; large AMIs take time |
+| `WorkflowFailed` | Inspect `$.rollback.result.actions`; fix root cause and re-run |
+| `CleanupFailed` | Archive succeeded; deregister manually or re-run with `cleanupOriginalAmi=true` |
 
 Helper Lambda logs:
 
@@ -197,7 +229,7 @@ aws logs tail /aws/lambda/ami-archive-helper --follow
 ```text
 template.yaml                          SAM template (Lambda + state machine + IAM)
 statemachine/archive_ami_to_s3_ia.asl.json
-src/helper.py                          prepare + convert operations
+src/helper.py                          prepare, convert, and rollback operations
 sample-input.json                      Example: auto-create bucket
 sample-input-existing-bucket.json      Example: existing bucket
 samconfig.toml                         SAM CLI deploy defaults (edit region)

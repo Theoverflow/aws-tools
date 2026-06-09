@@ -1,5 +1,5 @@
 {
-  "Comment": "Archive an EC2 AMI into S3 as a .bin object, convert it to S3 Standard-IA, and optionally deregister the source AMI with associated snapshots.",
+  "Comment": "Archive an EC2 AMI into S3 as a .bin object, convert it to S3 Standard-IA, and optionally deregister the source AMI. Idempotent re-runs resume from existing object or in-progress store tasks; failures trigger best-effort rollback.",
   "StartAt": "PrepareArchive",
   "States": {
     "PrepareArchive": {
@@ -13,7 +13,14 @@
         }
       },
       "OutputPath": "$.Payload",
-      "Next": "DescribeExistingStoreTask"
+      "Next": "DescribeExistingStoreTask",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "WorkflowFailedNoRollback"
+        }
+      ]
     },
     "DescribeExistingStoreTask": {
       "Type": "Task",
@@ -22,7 +29,14 @@
         "ImageIds.$": "States.Array($.amiId)"
       },
       "ResultPath": "$.describeTask",
-      "Next": "RouteByExistingState"
+      "Next": "RouteByExistingState",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RollbackResources"
+        }
+      ]
     },
     "RouteByExistingState": {
       "Type": "Choice",
@@ -35,12 +49,12 @@
         {
           "Variable": "$.objectExists",
           "BooleanEquals": true,
-          "Next": "ConvertObjectToStorageClass"
+          "Next": "MarkArchiveReady"
         },
         {
           "Variable": "$.describeTask.StoreImageTaskResults[0].StoreTaskState",
           "StringEquals": "Completed",
-          "Next": "ConvertObjectToStorageClass"
+          "Next": "MarkArchiveReady"
         },
         {
           "Variable": "$.describeTask.StoreImageTaskResults[0].StoreTaskState",
@@ -73,6 +87,19 @@
         ]
       },
       "ResultPath": "$.storeTask",
+      "Next": "MarkStoreTaskStarted",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RollbackResources"
+        }
+      ]
+    },
+    "MarkStoreTaskStarted": {
+      "Type": "Pass",
+      "Result": true,
+      "ResultPath": "$.storeTaskStartedThisRun",
       "Next": "WaitBeforePolling"
     },
     "WaitBeforePolling": {
@@ -87,7 +114,14 @@
         "ImageIds.$": "States.Array($.amiId)"
       },
       "ResultPath": "$.describeTask",
-      "Next": "IsStoreImageTaskDone"
+      "Next": "IsStoreImageTaskDone",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RollbackResources"
+        }
+      ]
     },
     "IsStoreImageTaskDone": {
       "Type": "Choice",
@@ -95,7 +129,7 @@
         {
           "Variable": "$.describeTask.StoreImageTaskResults[0].StoreTaskState",
           "StringEquals": "Completed",
-          "Next": "ConvertObjectToStorageClass"
+          "Next": "MarkArchiveReady"
         },
         {
           "Variable": "$.describeTask.StoreImageTaskResults[0].StoreTaskState",
@@ -109,6 +143,18 @@
         }
       ],
       "Default": "WaitBeforePolling"
+    },
+    "MarkArchiveReady": {
+      "Type": "Pass",
+      "Result": true,
+      "ResultPath": "$.archiveObjectReady",
+      "Next": "MarkConversionAttempted"
+    },
+    "MarkConversionAttempted": {
+      "Type": "Pass",
+      "Result": true,
+      "ResultPath": "$.conversionAttempted",
+      "Next": "ConvertObjectToStorageClass"
     },
     "ConvertObjectToStorageClass": {
       "Type": "Task",
@@ -127,6 +173,19 @@
         "convert.$": "$.Payload"
       },
       "ResultPath": "$.conversion",
+      "Next": "RecordStorageClassChanged",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RollbackResources"
+        }
+      ]
+    },
+    "RecordStorageClassChanged": {
+      "Type": "Pass",
+      "InputPath": "$.conversion.convert.changed",
+      "ResultPath": "$.storageClassChanged",
       "Next": "MaybeCleanupOriginalAmi"
     },
     "MaybeCleanupOriginalAmi": {
@@ -148,20 +207,63 @@
         "DeleteAssociatedSnapshots.$": "$.deleteAssociatedSnapshots"
       },
       "ResultPath": "$.cleanup",
-      "Next": "Success"
+      "Next": "Success",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupFailed"
+        }
+      ]
+    },
+    "RollbackResources": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${HelperLambdaArn}",
+        "Payload": {
+          "op": "rollback",
+          "state.$": "$"
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.rollback",
+      "Next": "WorkflowFailed",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.rollbackError",
+          "Next": "WorkflowFailed"
+        }
+      ]
     },
     "Success": {
       "Type": "Succeed"
     },
     "ExistingStoreTaskFailed": {
-      "Type": "Fail",
-      "Error": "ExistingStoreTaskFailed",
-      "Cause": "An existing EC2 AMI store task is in Failed state. Investigate or change the AMI/object key before retrying."
+      "Type": "Pass",
+      "Next": "RollbackResources"
     },
     "StoreImageTaskFailed": {
+      "Type": "Pass",
+      "Next": "RollbackResources"
+    },
+    "WorkflowFailed": {
       "Type": "Fail",
-      "Error": "StoreImageTaskFailed",
-      "Cause": "EC2 CreateStoreImageTask failed. Check DescribeStoreImageTasks and CloudTrail for details."
+      "Error": "WorkflowFailed",
+      "Cause": "AMI archive workflow failed after best-effort rollback. Inspect $.rollback.result.actions in the execution history."
+    },
+    "WorkflowFailedNoRollback": {
+      "Type": "Fail",
+      "Error": "PrepareFailed",
+      "Cause": "Prepare step failed before workflow state was initialized; no rollback performed."
+    },
+    "CleanupFailed": {
+      "Type": "Fail",
+      "Error": "CleanupFailed",
+      "Cause": "Archive and storage-class conversion succeeded, but AMI deregistration failed. The S3 archive object was preserved."
     }
   }
 }

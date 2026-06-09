@@ -55,10 +55,17 @@ Resources:
                 - s3:GetObject
                 - s3:HeadObject
                 - s3:PutObject
+                - s3:DeleteObject
                 - s3:PutObjectTagging
                 - s3:GetObjectTagging
                 - s3:AbortMultipartUpload
                 - s3:ListMultipartUploadParts
+                - s3:ListBucketMultipartUploads
+              Resource: '*'
+            - Sid: BucketDeleteOnRollback
+              Effect: Allow
+              Action:
+                - s3:DeleteBucket
               Resource: '*'
 
   ArchiveStateMachineRole:

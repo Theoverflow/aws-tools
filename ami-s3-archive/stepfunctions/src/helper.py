@@ -1,9 +1,7 @@
-import json
 import math
 import os
 import re
-import urllib.parse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -44,13 +42,12 @@ def _bucket_exists_or_owned(s3, bucket: str) -> bool:
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         if code in {"404", "NoSuchBucket", "NotFound"} or status == 404:
             return False
-        # 403 can mean the bucket exists but is not owned or not accessible.
         raise
 
 
-def _create_bucket_if_needed(s3, bucket: str, region: str) -> None:
+def _create_bucket_if_needed(s3, bucket: str, region: str) -> bool:
     if _bucket_exists_or_owned(s3, bucket):
-        return
+        return False
 
     if region == "us-east-1":
         s3.create_bucket(Bucket=bucket)
@@ -62,6 +59,7 @@ def _create_bucket_if_needed(s3, bucket: str, region: str) -> None:
 
     waiter = s3.get_waiter("bucket_exists")
     waiter.wait(Bucket=bucket)
+    return True
 
 
 def _secure_bucket_defaults(s3, bucket: str) -> None:
@@ -87,6 +85,21 @@ def _secure_bucket_defaults(s3, bucket: str) -> None:
             ]
         },
     )
+
+
+def _abort_multipart_uploads_for_key(s3, bucket: str, key: str) -> int:
+    paginator = s3.get_paginator("list_multipart_uploads")
+    aborted = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=key):
+        for upload in page.get("Uploads", []):
+            if upload.get("Key") != key:
+                continue
+            upload_id = upload.get("UploadId")
+            if not upload_id:
+                continue
+            s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            aborted += 1
+    return aborted
 
 
 def _region() -> str:
@@ -117,8 +130,9 @@ def prepare(event: Dict[str, Any]) -> Dict[str, Any]:
     if poll_seconds < 10:
         poll_seconds = 10
 
+    created_bucket_this_run = False
     if _bool(user_input.get("createBucket"), False):
-        _create_bucket_if_needed(s3, bucket, region)
+        created_bucket_this_run = _create_bucket_if_needed(s3, bucket, region)
         _secure_bucket_defaults(s3, bucket)
 
     object_key = user_input.get("objectKey") or f"{ami_id}.bin"
@@ -140,6 +154,12 @@ def prepare(event: Dict[str, Any]) -> Dict[str, Any]:
         "objectExists": object_exists,
         "currentStorageClass": current_storage_class,
         "alreadyInTargetStorageClass": already_in_target,
+        "createdBucketThisRun": created_bucket_this_run,
+        "objectExistedBefore": object_exists,
+        "storeTaskStartedThisRun": False,
+        "archiveObjectReady": object_exists,
+        "conversionAttempted": False,
+        "storageClassChanged": already_in_target,
     }
 
 
@@ -237,10 +257,64 @@ def convert(event: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def rollback(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort rollback aligned with the Rust CLI rollback policy."""
+    state = event.get("state", event)
+    region = _region()
+    s3 = boto3.client("s3", region_name=region)
+
+    bucket = state.get("bucketName", "")
+    key = state.get("objectKey", "")
+    actions: List[str] = []
+
+    created_bucket = _bool(state.get("createdBucketThisRun"), False)
+    object_existed_before = _bool(state.get("objectExistedBefore"), False)
+    store_task_started = _bool(state.get("storeTaskStartedThisRun"), False)
+    archive_ready = _bool(state.get("archiveObjectReady"), False)
+    conversion_attempted = _bool(state.get("conversionAttempted"), False)
+    storage_class_changed = _bool(state.get("storageClassChanged"), False)
+
+    if conversion_attempted and not storage_class_changed and bucket and key:
+        try:
+            count = _abort_multipart_uploads_for_key(s3, bucket, key)
+            if count:
+                actions.append(f"aborted_{count}_multipart_uploads")
+        except ClientError as exc:
+            actions.append(f"multipart_abort_failed:{exc.response['Error'].get('Code', 'error')}")
+
+    if store_task_started and not object_existed_before and not archive_ready and bucket and key:
+        try:
+            if _head_object(s3, bucket, key):
+                s3.delete_object(Bucket=bucket, Key=key)
+                actions.append("deleted_incomplete_object")
+        except ClientError as exc:
+            actions.append(f"object_delete_failed:{exc.response['Error'].get('Code', 'error')}")
+
+    if created_bucket and bucket:
+        try:
+            s3.delete_bucket(Bucket=bucket)
+            actions.append("deleted_empty_bucket")
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "error")
+            actions.append(f"bucket_delete_skipped:{code}")
+
+    if archive_ready and bucket and key:
+        actions.append(f"archive_preserved:s3://{bucket}/{key}")
+
+    return {
+        "rolledBack": True,
+        "actions": actions,
+        "bucketName": bucket,
+        "objectKey": key,
+    }
+
+
 def handler(event, context):
     op = event.get("op")
     if op == "prepare":
         return prepare(event)
     if op == "convert":
         return convert(event)
-    raise ValueError("Unknown op. Expected op=prepare or op=convert")
+    if op == "rollback":
+        return rollback(event)
+    raise ValueError("Unknown op. Expected op=prepare, op=convert, or op=rollback")
