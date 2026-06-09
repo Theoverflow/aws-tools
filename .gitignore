@@ -1,0 +1,15 @@
+# Rust build artifacts
+**/target/
+**/dist/
+**/*.rs.bk
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local env / secrets
+.env
+.env.*
+*.pem
