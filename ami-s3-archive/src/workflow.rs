@@ -2,6 +2,7 @@ use crate::aws::AwsClient;
 use crate::config::Config;
 use crate::error::{empty_default, AnyError};
 use crate::prompt::ask_yn;
+use crate::rollback::RollbackContext;
 use reqwest::blocking::Client;
 use std::time::{Duration, Instant};
 
@@ -24,26 +25,43 @@ pub fn run(cfg: &Config, client: &AwsClient, deadline: Instant) -> Result<(), An
         }
     }
 
+    let object_key = format!("{}.bin", cfg.ami_id);
+    let mut rollback = RollbackContext::new(bucket.clone(), object_key.clone(), cfg.dry_run);
+
+    let result = run_workflow(cfg, client, deadline, &mut bucket, &mut rollback);
+    if result.is_err() {
+        rollback.execute(client, cfg);
+    }
+    result
+}
+
+fn run_workflow(
+    cfg: &Config,
+    client: &AwsClient,
+    deadline: Instant,
+    bucket: &mut String,
+    rollback: &mut RollbackContext,
+) -> Result<(), AnyError> {
     if cfg.dry_run {
         client
             .log
             .info(format!("dry-run: would validate or create bucket s3://{bucket}"));
     } else {
-        ensure_bucket(client, cfg, &bucket)?;
+        ensure_bucket(client, cfg, bucket, rollback)?;
     }
 
-    let mut object_key = format!("{}.bin", cfg.ami_id);
+    let mut object_key = rollback.object_key.clone();
     if cfg.dry_run {
         client
             .log
             .info(format!("dry-run: would check object s3://{bucket}/{object_key}"));
         client
-            .ec2_dry_run_create_store_image_task(&cfg.ami_id, &bucket)?;
+            .ec2_dry_run_create_store_image_task(&cfg.ami_id, bucket)?;
         client
             .log
             .info("dry-run: EC2 CreateStoreImageTask permission check passed");
     } else {
-        object_key = archive_object(client, cfg, &bucket, object_key, deadline)?;
+        object_key = archive_object(client, cfg, bucket, object_key, deadline, rollback)?;
     }
 
     client
@@ -57,7 +75,12 @@ pub fn run(cfg: &Config, client: &AwsClient, deadline: Instant) -> Result<(), An
     Ok(())
 }
 
-fn ensure_bucket(client: &AwsClient, cfg: &Config, bucket: &str) -> Result<(), AnyError> {
+fn ensure_bucket(
+    client: &AwsClient,
+    cfg: &Config,
+    bucket: &str,
+    rollback: &mut RollbackContext,
+) -> Result<(), AnyError> {
     let exists = client.s3_bucket_exists(bucket)?;
     if !exists {
         if !cfg.create_bucket && !cfg.yes {
@@ -75,6 +98,7 @@ fn ensure_bucket(client: &AwsClient, cfg: &Config, bucket: &str) -> Result<(), A
             return Err("bucket creation declined".into());
         }
         client.s3_create_bucket(bucket)?;
+        rollback.created_bucket = true;
         client.log.info(format!("created bucket s3://{bucket}"));
     }
     client.s3_put_public_access_block(bucket)?;
@@ -94,8 +118,10 @@ fn archive_object(
     bucket: &str,
     mut object_key: String,
     deadline: Instant,
+    rollback: &mut RollbackContext,
 ) -> Result<String, AnyError> {
     let mut head = client.s3_head_object(bucket, &object_key)?;
+    rollback.object_existed_before = head.exists;
     if head.exists {
         client.log.info(format!(
             "object already exists: s3://{bucket}/{object_key} storage_class={} size={}",
@@ -103,7 +129,11 @@ fn archive_object(
             head.content_length
         ));
     } else {
-        object_key = start_or_resume_store_task(client, cfg, bucket, object_key, deadline)?;
+        let (key, started_new) =
+            start_or_resume_store_task(client, cfg, bucket, object_key, deadline)?;
+        rollback.store_task_started_this_run = started_new;
+        object_key = key;
+        rollback.set_object_key(object_key.clone());
     }
 
     head = client.s3_head_object(bucket, &object_key)?;
@@ -113,6 +143,7 @@ fn archive_object(
         )
         .into());
     }
+    rollback.mark_archive_ready();
 
     let current_class = empty_default(&head.storage_class, "STANDARD").to_string();
     if current_class != cfg.storage_class {
@@ -120,12 +151,14 @@ fn archive_object(
             "transitioning object storage class: s3://{bucket}/{object_key} {current_class} -> {}",
             cfg.storage_class
         ));
+        rollback.conversion_attempted = true;
         client.s3_copy_object_to_storage_class(
             bucket,
             &object_key,
             &cfg.storage_class,
             head.content_length,
         )?;
+        rollback.storage_class_changed = true;
         client
             .log
             .info(format!("object storage class updated to {}", cfg.storage_class));
@@ -145,7 +178,8 @@ fn start_or_resume_store_task(
     bucket: &str,
     mut object_key: String,
     deadline: Instant,
-) -> Result<String, AnyError> {
+) -> Result<(String, bool), AnyError> {
+    let mut started_new = false;
     let task = client.ec2_latest_store_image_task(&cfg.ami_id)?;
     if !task.image_id.is_empty()
         && task.bucket.eq_ignore_ascii_case(bucket)
@@ -170,6 +204,7 @@ fn start_or_resume_store_task(
         ));
     } else {
         object_key = client.ec2_create_store_image_task(&cfg.ami_id, bucket)?;
+        started_new = true;
         client.log.info(format!(
             "created store image task object=s3://{bucket}/{object_key}"
         ));
@@ -190,7 +225,7 @@ fn start_or_resume_store_task(
         );
     }
 
-    Ok(object_key)
+    Ok((object_key, started_new))
 }
 
 fn maybe_cleanup(client: &AwsClient, cfg: &Config) -> Result<(), AnyError> {

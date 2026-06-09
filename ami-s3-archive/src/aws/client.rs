@@ -10,8 +10,8 @@ use crate::error::{summarize, AnyError, AwsError};
 use crate::log::Logger;
 use crate::types::{Credentials, MultipartPart, ObjectHead, StoreImageTask};
 use crate::xml::{
-    parse_delete_snapshot_results, parse_store_image_tasks, xml_escape, xml_tag_first,
-    xml_tags_all,
+    parse_delete_snapshot_results, parse_store_image_tasks, xml_escape, xml_item_chunks,
+    xml_tag_first, xml_tags_all,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -433,6 +433,68 @@ impl AwsClient {
             Err(e) if e.status == 404 => Ok(ObjectHead::default()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub fn s3_delete_object(&self, bucket: &str, key: &str) -> Result<(), AnyError> {
+        let path = format!("/{}", escape_s3_key(key));
+        self.s3_signed_request(
+            "DELETE",
+            &s3_endpoint(bucket, &self.region),
+            &path,
+            "",
+            vec![],
+            vec![],
+        )?;
+        Ok(())
+    }
+
+    pub fn s3_delete_bucket(&self, bucket: &str) -> Result<(), AnyError> {
+        self.s3_signed_request(
+            "DELETE",
+            &s3_endpoint(bucket, &self.region),
+            "/",
+            "",
+            vec![],
+            vec![],
+        )?;
+        Ok(())
+    }
+
+    pub fn s3_abort_multipart_uploads_for_key(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<usize, AnyError> {
+        let upload_ids = self.s3_list_multipart_upload_ids(bucket, key)?;
+        for upload_id in &upload_ids {
+            self.s3_abort_multipart_upload(bucket, key, upload_id)?;
+        }
+        Ok(upload_ids.len())
+    }
+
+    fn s3_list_multipart_upload_ids(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, AnyError> {
+        let raw_query = form_body(&[("uploads", ""), ("prefix", prefix)]);
+        let r = self.s3_signed_request(
+            "GET",
+            &s3_endpoint(bucket, &self.region),
+            "/",
+            &raw_query,
+            vec![],
+            vec![],
+        )?;
+        let body = String::from_utf8_lossy(&r.body);
+        let mut upload_ids = Vec::new();
+        for item in xml_item_chunks(&body) {
+            let item_key = xml_tag_first(item, &["Key"]).unwrap_or_default();
+            if item_key == prefix {
+                if let Some(upload_id) = xml_tag_first(item, &["UploadId"]) {
+                    if !upload_id.is_empty() {
+                        upload_ids.push(upload_id);
+                    }
+                }
+            }
+        }
+        Ok(upload_ids)
     }
 
     pub fn s3_copy_object_to_storage_class(

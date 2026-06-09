@@ -58,6 +58,10 @@ AMI ID
   -> s3://bucket/ami-xxxx.bin
   -> copy in-place to STANDARD_IA (multipart if >= 5 GiB)
   -> optional: DeregisterImage + DeleteAssociatedSnapshots
+
+On failure after partial progress, the CLI attempts best-effort rollback:
+abort in-flight multipart uploads, delete incomplete objects created this run,
+and remove an empty bucket if this run created it. Completed archive objects are kept.
 ```
 
 ## Credential sources

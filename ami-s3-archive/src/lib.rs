@@ -5,6 +5,7 @@ pub mod credentials;
 pub mod error;
 pub mod log;
 pub mod prompt;
+pub mod rollback;
 pub mod types;
 pub mod workflow;
 pub mod xml;
