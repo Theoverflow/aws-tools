@@ -1,10 +1,19 @@
 # ami-s3-archive
 
-Standalone Rust CLI to archive EC2 AMIs to S3 (`STANDARD_IA` by default) using `CreateStoreImageTask`.
+Archive EC2 AMIs to S3 (`STANDARD_IA` by default) using EC2 `CreateStoreImageTask`.
 
-No `aws` CLI, no Python — direct AWS SigV4 over HTTPS (`reqwest` + `rustls`).
+Two deployment options:
 
-## Build
+| Option | Path | Best for |
+|--------|------|----------|
+| **Rust CLI** | this directory | Laptop, CI, no AWS CLI dependency |
+| **Step Functions** | [stepfunctions/](./stepfunctions/) | Scheduled/automated runs in AWS |
+
+## Rust CLI
+
+Standalone binary — direct AWS SigV4 over HTTPS (`reqwest` + `rustls`).
+
+### Build
 
 ```bash
 cd ami-s3-archive
@@ -69,4 +78,5 @@ src/
   workflow.rs      orchestration
   aws/             SigV4 client (EC2, S3, STS)
   xml.rs           EC2 XML parsing
+stepfunctions/     SAM template + Step Functions workflow (see stepfunctions/README.md)
 ```

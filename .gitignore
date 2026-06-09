@@ -3,6 +3,9 @@
 **/dist/
 **/*.rs.bk
 
+# SAM build artifacts
+**/.aws-sam/
+
 # IDE / OS
 .idea/
 .vscode/

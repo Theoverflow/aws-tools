@@ -1,0 +1,8 @@
+{
+  "amiId": "ami-0123456789abcdef0",
+  "createBucket": true,
+  "storageClass": "STANDARD_IA",
+  "cleanupOriginalAmi": false,
+  "deleteAssociatedSnapshots": true,
+  "pollSeconds": 60
+}

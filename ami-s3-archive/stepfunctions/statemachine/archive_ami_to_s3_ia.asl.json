@@ -1,0 +1,167 @@
+{
+  "Comment": "Archive an EC2 AMI into S3 as a .bin object, convert it to S3 Standard-IA, and optionally deregister the source AMI with associated snapshots.",
+  "StartAt": "PrepareArchive",
+  "States": {
+    "PrepareArchive": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${HelperLambdaArn}",
+        "Payload": {
+          "op": "prepare",
+          "input.$": "$"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "Next": "DescribeExistingStoreTask"
+    },
+    "DescribeExistingStoreTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:describeStoreImageTasks",
+      "Parameters": {
+        "ImageIds.$": "States.Array($.amiId)"
+      },
+      "ResultPath": "$.describeTask",
+      "Next": "RouteByExistingState"
+    },
+    "RouteByExistingState": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.alreadyInTargetStorageClass",
+          "BooleanEquals": true,
+          "Next": "MaybeCleanupOriginalAmi"
+        },
+        {
+          "Variable": "$.objectExists",
+          "BooleanEquals": true,
+          "Next": "ConvertObjectToStorageClass"
+        },
+        {
+          "Variable": "$.describeTask.StoreImageTaskResults[0].StoreTaskState",
+          "StringEquals": "Completed",
+          "Next": "ConvertObjectToStorageClass"
+        },
+        {
+          "Variable": "$.describeTask.StoreImageTaskResults[0].StoreTaskState",
+          "StringEquals": "InProgress",
+          "Next": "WaitBeforePolling"
+        },
+        {
+          "Variable": "$.describeTask.StoreImageTaskResults[0].StoreTaskState",
+          "StringEquals": "Failed",
+          "Next": "ExistingStoreTaskFailed"
+        }
+      ],
+      "Default": "StartStoreImageTask"
+    },
+    "StartStoreImageTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:createStoreImageTask",
+      "Parameters": {
+        "ImageId.$": "$.amiId",
+        "Bucket.$": "$.bucketName",
+        "S3ObjectTags": [
+          {
+            "Key": "ManagedBy",
+            "Value": "StepFunctionsAMIArchive"
+          },
+          {
+            "Key": "SourceAmiId",
+            "Value.$": "$.amiId"
+          }
+        ]
+      },
+      "ResultPath": "$.storeTask",
+      "Next": "WaitBeforePolling"
+    },
+    "WaitBeforePolling": {
+      "Type": "Wait",
+      "SecondsPath": "$.pollSeconds",
+      "Next": "PollStoreImageTask"
+    },
+    "PollStoreImageTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:describeStoreImageTasks",
+      "Parameters": {
+        "ImageIds.$": "States.Array($.amiId)"
+      },
+      "ResultPath": "$.describeTask",
+      "Next": "IsStoreImageTaskDone"
+    },
+    "IsStoreImageTaskDone": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.describeTask.StoreImageTaskResults[0].StoreTaskState",
+          "StringEquals": "Completed",
+          "Next": "ConvertObjectToStorageClass"
+        },
+        {
+          "Variable": "$.describeTask.StoreImageTaskResults[0].StoreTaskState",
+          "StringEquals": "InProgress",
+          "Next": "WaitBeforePolling"
+        },
+        {
+          "Variable": "$.describeTask.StoreImageTaskResults[0].StoreTaskState",
+          "StringEquals": "Failed",
+          "Next": "StoreImageTaskFailed"
+        }
+      ],
+      "Default": "WaitBeforePolling"
+    },
+    "ConvertObjectToStorageClass": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${HelperLambdaArn}",
+        "Payload": {
+          "op": "convert",
+          "amiId.$": "$.amiId",
+          "bucketName.$": "$.bucketName",
+          "objectKey.$": "$.objectKey",
+          "storageClass.$": "$.storageClass"
+        }
+      },
+      "ResultSelector": {
+        "convert.$": "$.Payload"
+      },
+      "ResultPath": "$.conversion",
+      "Next": "MaybeCleanupOriginalAmi"
+    },
+    "MaybeCleanupOriginalAmi": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.cleanupOriginalAmi",
+          "BooleanEquals": true,
+          "Next": "DeregisterOriginalAmi"
+        }
+      ],
+      "Default": "Success"
+    },
+    "DeregisterOriginalAmi": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:deregisterImage",
+      "Parameters": {
+        "ImageId.$": "$.amiId",
+        "DeleteAssociatedSnapshots.$": "$.deleteAssociatedSnapshots"
+      },
+      "ResultPath": "$.cleanup",
+      "Next": "Success"
+    },
+    "Success": {
+      "Type": "Succeed"
+    },
+    "ExistingStoreTaskFailed": {
+      "Type": "Fail",
+      "Error": "ExistingStoreTaskFailed",
+      "Cause": "An existing EC2 AMI store task is in Failed state. Investigate or change the AMI/object key before retrying."
+    },
+    "StoreImageTaskFailed": {
+      "Type": "Fail",
+      "Error": "StoreImageTaskFailed",
+      "Cause": "EC2 CreateStoreImageTask failed. Check DescribeStoreImageTasks and CloudTrail for details."
+    }
+  }
+}

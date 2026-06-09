@@ -1,6 +1,7 @@
 use crate::aws::endpoints::{
     ec2_endpoint, escape_s3_key, form_body, s3_endpoint, sts_endpoint,
 };
+use crate::aws::retry::{is_s3_retryable, s3_backoff_delay, S3_MAX_ATTEMPTS};
 use crate::aws::sign::sign_v4;
 use crate::constants::{
     DEFAULT_PART_SIZE_BYTES, EC2_API_VERSION, MAX_SINGLE_COPY_BYTES, USER_AGENT,
@@ -111,6 +112,43 @@ impl AwsClient {
             headers,
             body: bytes,
         })
+    }
+
+    fn s3_signed_request(
+        &self,
+        method: &str,
+        endpoint: &str,
+        path: &str,
+        raw_query: &str,
+        headers: Vec<(&str, String)>,
+        body: Vec<u8>,
+    ) -> Result<HttpResult, AwsError> {
+        let mut attempt = 0u32;
+        loop {
+            match self.signed_request(
+                "s3",
+                method,
+                endpoint,
+                path,
+                raw_query,
+                headers.clone(),
+                body.clone(),
+            ) {
+                Ok(result) => return Ok(result),
+                Err(err) if is_s3_retryable(&err) && attempt + 1 < S3_MAX_ATTEMPTS => {
+                    let delay = s3_backoff_delay(attempt);
+                    self.log.debug(format!(
+                        "S3 {method} retry {} after {}ms (HTTP {})",
+                        attempt + 1,
+                        delay.as_millis(),
+                        err.status
+                    ));
+                    thread::sleep(delay);
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     pub fn get_caller_identity(&self) -> Result<String, AnyError> {
@@ -300,8 +338,7 @@ impl AwsClient {
     }
 
     pub fn s3_bucket_exists(&self, bucket: &str) -> Result<bool, AnyError> {
-        match self.signed_request(
-            "s3",
+        match self.s3_signed_request(
             "HEAD",
             &s3_endpoint(bucket, &self.region),
             "/",
@@ -327,8 +364,7 @@ impl AwsClient {
                 xml_escape(&self.region)
             )
         };
-        self.signed_request(
-            "s3",
+        self.s3_signed_request(
             "PUT",
             &s3_endpoint(bucket, &self.region),
             "/",
@@ -341,8 +377,7 @@ impl AwsClient {
 
     pub fn s3_put_public_access_block(&self, bucket: &str) -> Result<(), AnyError> {
         let body = "<PublicAccessBlockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>";
-        self.signed_request(
-            "s3",
+        self.s3_signed_request(
             "PUT",
             &s3_endpoint(bucket, &self.region),
             "/",
@@ -355,8 +390,7 @@ impl AwsClient {
 
     pub fn s3_put_bucket_encryption(&self, bucket: &str) -> Result<(), AnyError> {
         let body = "<ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
-        self.signed_request(
-            "s3",
+        self.s3_signed_request(
             "PUT",
             &s3_endpoint(bucket, &self.region),
             "/",
@@ -369,8 +403,7 @@ impl AwsClient {
 
     pub fn s3_head_object(&self, bucket: &str, key: &str) -> Result<ObjectHead, AnyError> {
         let path = format!("/{}", escape_s3_key(key));
-        match self.signed_request(
-            "s3",
+        match self.s3_signed_request(
             "HEAD",
             &s3_endpoint(bucket, &self.region),
             &path,
@@ -424,8 +457,7 @@ impl AwsClient {
     ) -> Result<(), AnyError> {
         let path = format!("/{}", escape_s3_key(key));
         let copy_source = format!("/{}/{}", bucket, escape_s3_key(key));
-        self.signed_request(
-            "s3",
+        self.s3_signed_request(
             "PUT",
             &s3_endpoint(bucket, &self.region),
             &path,
@@ -504,8 +536,7 @@ impl AwsClient {
         storage_class: &str,
     ) -> Result<String, AnyError> {
         let path = format!("/{}", escape_s3_key(key));
-        let r = self.signed_request(
-            "s3",
+        let r = self.s3_signed_request(
             "POST",
             &s3_endpoint(bucket, &self.region),
             &path,
@@ -543,8 +574,7 @@ impl AwsClient {
             ("partNumber", &part_number.to_string()),
             ("uploadId", upload_id),
         ]);
-        let r = self.signed_request(
-            "s3",
+        let r = self.s3_signed_request(
             "PUT",
             &s3_endpoint(bucket, &self.region),
             &path,
@@ -586,8 +616,7 @@ impl AwsClient {
             body.push_str("</ETag></Part>");
         }
         body.push_str("</CompleteMultipartUpload>");
-        self.signed_request(
-            "s3",
+        self.s3_signed_request(
             "POST",
             &s3_endpoint(bucket, &self.region),
             &path,
@@ -606,8 +635,7 @@ impl AwsClient {
     ) -> Result<(), AnyError> {
         let path = format!("/{}", escape_s3_key(key));
         let raw_query = form_body(&[("uploadId", upload_id)]);
-        self.signed_request(
-            "s3",
+        self.s3_signed_request(
             "DELETE",
             &s3_endpoint(bucket, &self.region),
             &path,

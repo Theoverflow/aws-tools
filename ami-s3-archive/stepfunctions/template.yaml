@@ -1,0 +1,131 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Step Functions workflow to archive an EC2 AMI into S3, convert the .bin object to Standard-IA, and optionally deregister the source AMI.
+
+Parameters:
+  StateMachineName:
+    Type: String
+    Default: ami-archive-to-s3-ia
+  HelperFunctionName:
+    Type: String
+    Default: ami-archive-helper
+  HelperTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+  HelperMemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 10240
+
+Resources:
+  HelperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref HelperFunctionName
+      Runtime: python3.12
+      Handler: helper.handler
+      CodeUri: src/
+      Timeout: !Ref HelperTimeoutSeconds
+      MemorySize: !Ref HelperMemorySize
+      Architectures:
+        - x86_64
+      Policies:
+        - Statement:
+            - Sid: StsIdentity
+              Effect: Allow
+              Action:
+                - sts:GetCallerIdentity
+              Resource: '*'
+            - Sid: BucketManagement
+              Effect: Allow
+              Action:
+                - s3:CreateBucket
+                - s3:HeadBucket
+                - s3:PutBucketPublicAccessBlock
+                - s3:PutBucketEncryption
+                - s3:GetBucketLocation
+                - s3:PutBucketVersioning
+              Resource: '*'
+            - Sid: ObjectManagement
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:HeadObject
+                - s3:PutObject
+                - s3:PutObjectTagging
+                - s3:GetObjectTagging
+                - s3:AbortMultipartUpload
+                - s3:ListMultipartUploadParts
+              Resource: '*'
+
+  ArchiveStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ami-archive-state-machine-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeHelper
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt HelperFunction.Arn
+              - Sid: Ec2AmiStoreAndCleanup
+                Effect: Allow
+                Action:
+                  - ec2:CreateStoreImageTask
+                  - ec2:DescribeStoreImageTasks
+                  - ec2:DeregisterImage
+                  - ec2:DescribeImages
+                  - ec2:DescribeTags
+                  - ec2:CreateTags
+                  - ec2:GetEbsEncryptionByDefault
+                Resource: '*'
+              - Sid: EbsDirectApiForAmiStore
+                Effect: Allow
+                Action:
+                  - ebs:CompleteSnapshot
+                  - ebs:GetSnapshotBlock
+                  - ebs:ListChangedBlocks
+                  - ebs:ListSnapshotBlocks
+                  - ebs:PutSnapshotBlock
+                  - ebs:StartSnapshot
+                Resource: '*'
+              - Sid: S3ForEc2StoreImageTask
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:AbortMultipartUpload
+                Resource: '*'
+
+  ArchiveStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Ref StateMachineName
+      Type: STANDARD
+      Role: !GetAtt ArchiveStateMachineRole.Arn
+      DefinitionUri: statemachine/archive_ami_to_s3_ia.asl.json
+      DefinitionSubstitutions:
+        HelperLambdaArn: !GetAtt HelperFunction.Arn
+
+Outputs:
+  StateMachineArn:
+    Description: Step Functions state machine ARN.
+    Value: !Ref ArchiveStateMachine
+  HelperFunctionArn:
+    Description: Helper Lambda ARN.
+    Value: !GetAtt HelperFunction.Arn
