@@ -217,6 +217,8 @@ Use EC2 `CreateRestoreImageTask` against the S3 object (e.g. `s3://bucket/ami-01
 | Access denied on bucket | Bucket policy must allow the state machine role and EC2 store task principal |
 | `WorkflowFailed` | Inspect `$.rollback.result.actions`; fix root cause and re-run |
 | `CleanupFailed` | Archive succeeded; deregister manually or re-run with `cleanupOriginalAmi=true` |
+| `ResourceExistenceCheck` failed on deploy | Lambda/state machine name already used by another stack — update the existing stack or use different `HelperFunctionName` / `StateMachineName` |
+| Stack stuck in `REVIEW_IN_PROGRESS` | `aws cloudformation delete-stack --stack-name <name>` then redeploy |
 
 Helper Lambda logs:
 

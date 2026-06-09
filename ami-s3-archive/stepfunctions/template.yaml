@@ -5,10 +5,12 @@ Description: Step Functions workflow to archive an EC2 AMI into S3, convert the 
 Parameters:
   StateMachineName:
     Type: String
-    Default: ami-archive-to-s3-ia
+    Default: ""
+    Description: Optional fixed state machine name. Leave empty to let CloudFormation assign a unique name.
   HelperFunctionName:
     Type: String
-    Default: ami-archive-helper
+    Default: ""
+    Description: Optional fixed Lambda function name. Leave empty to let CloudFormation assign a unique name.
   HelperTimeoutSeconds:
     Type: Number
     Default: 900
@@ -20,11 +22,18 @@ Parameters:
     MinValue: 128
     MaxValue: 10240
 
+Conditions:
+  HasStateMachineName: !Not [!Equals [!Ref StateMachineName, ""]]
+  HasHelperFunctionName: !Not [!Equals [!Ref HelperFunctionName, ""]]
+
 Resources:
   HelperFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Ref HelperFunctionName
+      FunctionName: !If
+        - HasHelperFunctionName
+        - !Ref HelperFunctionName
+        - !Ref AWS::NoValue
       Runtime: python3.12
       Handler: helper.handler
       CodeUri: src/
@@ -122,7 +131,10 @@ Resources:
   ArchiveStateMachine:
     Type: AWS::Serverless::StateMachine
     Properties:
-      Name: !Ref StateMachineName
+      Name: !If
+        - HasStateMachineName
+        - !Ref StateMachineName
+        - !Ref AWS::NoValue
       Type: STANDARD
       Role: !GetAtt ArchiveStateMachineRole.Arn
       DefinitionUri: statemachine/archive_ami_to_s3_ia.asl.json

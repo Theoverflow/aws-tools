@@ -1,9 +1,9 @@
 version = 0.1
 
 [default.deploy.parameters]
-stack_name = "ami-s3-archive-stepfunctions"
+stack_name = "ami-s3-archive-stpfn"
 resolve_s3 = true
-s3_prefix = "ami-s3-archive-stepfunctions"
+s3_prefix = "ami-s3-archive-stpfn"
 region = "eu-west-3"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
